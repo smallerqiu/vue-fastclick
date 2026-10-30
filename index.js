@@ -6,7 +6,9 @@
 	 *
 	 * @codingstandard ftlabs-jsv2
 	 * @copyright The Financial Times Limited [All Rights Reserved]
-	 * @license MIT License (see LICENSE.txt)
+	 * @license MIT License (see LICENSE)
+	 *
+	 * Forked and maintained by Qiu (https://github.com/smallerqiu/vue-fastclick)
 	 */
 
   /*jslint browser:true, node:true*/
@@ -102,9 +104,32 @@
 		 */
     this.tapTimeout = options.tapTimeout || 700;
 
-    if (FastClick.notNeeded(layer)) {
-      return;
-    }
+		/**
+		 * Whether pinch-zoom and double-tap-zoom are disabled on the layer.
+		 * Enabled by default to keep the behaviour of 1.0.x.
+		 *
+		 * @type boolean
+		 */
+    this.disableZoom = options.disableZoom !== false;
+
+		/**
+		 * Whether the iOS long-press magnifier (and the text selection it needs) is disabled.
+		 * Form controls keep their selection, see lockZoom().
+		 *
+		 * @type boolean
+		 */
+    this.disableLongPressMagnifier = options.disableLongPressMagnifier !== false;
+
+    // Saved state so destroy() can undo everything we touched.
+    this.savedStyle = null;
+    this.styleElement = null;
+    this.layerAttributeValue = null;
+    this.savedLayerAttribute = null;
+    this.gestureStartAttached = false;
+    this.clickListenersAttached = false;
+    this.patchedListeners = false;
+    this.oldOnClickWrapper = null;
+    this.oldOnClick = null;
 
     // Some old versions of Android don't have Function.prototype.bind
     function bind(method, context) {
@@ -112,10 +137,20 @@
     }
 
 
-    var methods = ['onMouse', 'onClick', 'onTouchStart', 'onTouchMove', 'onTouchEnd', 'onTouchCancel'];
+    var methods = ['onMouse', 'onClick', 'onTouchStart', 'onTouchMove', 'onTouchEnd', 'onTouchCancel', 'onGestureStart'];
     var context = this;
     for (var i = 0, l = methods.length; i < l; i++) {
       context[methods[i]] = bind(context[methods[i]], context);
+    }
+
+    // The click-delay fix may not be needed even when the caller wants zoom locked.
+    // Evaluate this before lockZoom() changes touch-action, which notNeeded() checks.
+    var needsClickFix = !FastClick.notNeeded(layer);
+
+    this.lockZoom();
+
+    if (!needsClickFix) {
+      return;
     }
 
     // Set up event handlers as required
@@ -130,13 +165,13 @@
     layer.addEventListener('touchmove', this.onTouchMove, false);
     layer.addEventListener('touchend', this.onTouchEnd, false);
     layer.addEventListener('touchcancel', this.onTouchCancel, false);
-    layer.addEventListener('gesturestart', function (event) {
-      event.preventDefault();
-    });
+    this.clickListenersAttached = true;
+
     // Hack is required for browsers that don't support Event#stopImmediatePropagation (e.g. Android 2)
     // which is how FastClick normally stops click events bubbling to callbacks registered on the FastClick
     // layer when they are cancelled.
     if (!Event.prototype.stopImmediatePropagation) {
+      this.patchedListeners = true;
       layer.removeEventListener = function (type, callback, capture) {
         var rmv = Node.prototype.removeEventListener;
         if (type === 'click') {
@@ -168,26 +203,36 @@
       // Android browser on at least 3.2 requires a new reference to the function in layer.onclick
       // - the old one won't work if passed to addEventListener directly.
       oldOnClick = layer.onclick;
-      layer.addEventListener('click', function (event) {
+      this.oldOnClick = oldOnClick;
+      this.oldOnClickWrapper = function (event) {
         oldOnClick(event);
-      }, false);
+      };
+      layer.addEventListener('click', this.oldOnClickWrapper, false);
       layer.onclick = null;
     }
   }
+
+	/**
+	 * Cached user agent. Guarded so the module can be imported during SSR,
+	 * where navigator may not exist (Node < 21).
+	 *
+	 * @type string
+	 */
+  var userAgent = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
 
 	/**
 	* Windows Phone 8.1 fakes user agent string to look like Android and iPhone.
 	*
 	* @type boolean
 	*/
-  var deviceIsWindowsPhone = navigator.userAgent.indexOf("Windows Phone") >= 0;
+  var deviceIsWindowsPhone = userAgent.indexOf("Windows Phone") >= 0;
 
 	/**
 	 * Android requires exceptions.
 	 *
 	 * @type boolean
 	 */
-  var deviceIsAndroid = navigator.userAgent.indexOf('Android') > 0 && !deviceIsWindowsPhone;
+  var deviceIsAndroid = userAgent.indexOf('Android') > 0 && !deviceIsWindowsPhone;
 
 
 	/**
@@ -195,7 +240,7 @@
 	 *
 	 * @type boolean
 	 */
-  var deviceIsIOS = /iP(ad|hone|od)/.test(navigator.userAgent) && !deviceIsWindowsPhone;
+  var deviceIsIOS = /iP(ad|hone|od)/.test(userAgent) && !deviceIsWindowsPhone;
 
 
 	/**
@@ -203,7 +248,7 @@
 	 *
 	 * @type boolean
 	 */
-  var deviceIsIOS4 = deviceIsIOS && (/OS 4_\d(_\d)?/).test(navigator.userAgent);
+  var deviceIsIOS4 = deviceIsIOS && (/OS 4_\d(_\d)?/).test(userAgent);
 
 
 	/**
@@ -211,14 +256,22 @@
 	 *
 	 * @type boolean
 	 */
-  var deviceIsIOSWithBadTarget = deviceIsIOS && (/OS [6-7]_\d/).test(navigator.userAgent);
+  var deviceIsIOSWithBadTarget = deviceIsIOS && (/OS [6-7]_\d/).test(userAgent);
 
 	/**
 	 * BlackBerry requires exceptions.
 	 *
 	 * @type boolean
 	 */
-  var deviceIsBlackBerry10 = navigator.userAgent.indexOf('BB10') > 0;
+  var deviceIsBlackBerry10 = userAgent.indexOf('BB10') > 0;
+
+	/**
+	 * Counter used to give every locked layer its own attribute value for the
+	 * "form controls keep their selection" stylesheet.
+	 *
+	 * @type number
+	 */
+  var lockZoomUid = 0;
 
 	/**
 	 * Determine whether a given element requires a native click.
@@ -294,7 +347,7 @@
 	 * @param {Event} event
 	 */
   FastClick.prototype.sendClick = function (targetElement, event) {
-    var clickEvent, touch;
+    var clickEvent, touch, doc, view;
 
     // On some Android devices activeElement needs to be blurred otherwise the synthetic click will have no effect (#24)
     if (document.activeElement && document.activeElement !== targetElement) {
@@ -303,9 +356,13 @@
 
     touch = event.changedTouches[0];
 
+    // Use the target's own document/view so this also works inside iframes.
+    doc = targetElement.ownerDocument || document;
+    view = doc.defaultView || window;
+
     // Synthesise a click event, with an extra attribute so it can be tracked
-    clickEvent = document.createEvent('MouseEvents');
-    clickEvent.initMouseEvent(this.determineEventType(targetElement), true, true, window, 1, touch.screenX, touch.screenY, touch.clientX, touch.clientY, false, false, false, false, 0, null);
+    clickEvent = doc.createEvent('MouseEvents');
+    clickEvent.initMouseEvent(this.determineEventType(targetElement), true, true, view, 1, touch.screenX, touch.screenY, touch.clientX, touch.clientY, false, false, false, false, 0, null);
     clickEvent.forwardedTouchEvent = true;
     targetElement.dispatchEvent(clickEvent);
   };
@@ -328,6 +385,8 @@
     var length;
 
     // Issue #160: on iOS 7, some input elements (e.g. date datetime month) throw a vague TypeError on setSelectionRange. These elements don't have an integer value for the selectionStart and selectionEnd properties, but unfortunately that can't be used for detection because accessing the properties also throws a TypeError. Just check the type instead. Filed as Apple bug #15122724.
+    // Whitelist instead of an exclude list: setSelectionRange only applies to text-like
+    // types, and WebKit throws InvalidStateError for the others (email, number, date...).
     if (deviceIsIOS && targetElement.setSelectionRange &&
       (
         targetElement.type === 'text' ||
@@ -591,9 +650,7 @@
 
       // Select elements need the event to go through on iOS 4, otherwise the selector menu won't open.
       // Also this breaks opening selects when VoiceOver is active on iOS6, iOS7 (and possibly others)
-      var isTextInput = function () { return targetTagName === 'textarea' || targetTagName === 'input'; }
-
-      if ((!deviceIsIOS || targetTagName !== 'select') & !isTextInput) {
+      if (!deviceIsIOS || targetTagName !== 'select') {
         this.targetElement = null;
         event.preventDefault();
       }
@@ -717,24 +774,167 @@
 
 
 	/**
-	 * Remove all FastClick's event listeners.
+	 * Apply the zoom lock requested through the options.
+	 *
+	 * touch-action is the native switch and also covers Android; old iOS ignores it,
+	 * so gesturestart is kept as a guard there. The long-press magnifier is tied to
+	 * text selection, which can only be turned off with user-select; that inherits
+	 * into form controls, so a tiny stylesheet gives them their selection back.
+	 *
+	 * @returns {void}
+	 */
+  FastClick.prototype.lockZoom = function () {
+    var layer = this.layer;
+    var styleElement;
+    var value;
+    var selector;
+    var i;
+    var names = ['touch-action', 'user-select', '-webkit-user-select', '-webkit-touch-callout'];
+
+    if (typeof window === 'undefined' || typeof window.ontouchstart === 'undefined' || (!this.disableZoom && !this.disableLongPressMagnifier)) {
+      return;
+    }
+
+    this.savedStyle = [];
+    for (i = 0; i < names.length; i++) {
+      this.savedStyle.push([names[i], layer.style.getPropertyValue(names[i]), layer.style.getPropertyPriority(names[i])]);
+    }
+
+    if (this.disableZoom) {
+      // Keep panning, drop pinch-zoom and double-tap-zoom.
+      layer.style.setProperty('touch-action', 'pan-x pan-y');
+      // Old iOS has no touch-action support, but still fires gesturestart.
+      layer.addEventListener('gesturestart', this.onGestureStart, false);
+      this.gestureStartAttached = true;
+    }
+
+    if (this.disableLongPressMagnifier) {
+      layer.style.setProperty('-webkit-user-select', 'none');
+      layer.style.setProperty('user-select', 'none');
+      layer.style.setProperty('-webkit-touch-callout', 'none');
+
+      // Attribute selector instead of classList: works on very old Android too.
+      value = 'lock-' + (++lockZoomUid);
+      this.savedLayerAttribute = layer.getAttribute('data-fastclick-layer');
+      layer.setAttribute('data-fastclick-layer', value);
+      this.layerAttributeValue = value;
+
+      selector = '[data-fastclick-layer="' + value + '"]';
+      styleElement = document.createElement('style');
+      styleElement.setAttribute('data-fastclick', value);
+      styleElement.textContent = selector + ' input,' +
+        selector + ' textarea,' +
+        selector + ' select,' +
+        selector + ' [contenteditable=""],' +
+        selector + ' [contenteditable="true"] {' +
+        '-webkit-user-select: text; user-select: text; }';
+      (document.head || document.documentElement).appendChild(styleElement);
+      this.styleElement = styleElement;
+    }
+  };
+
+
+	/**
+	 * Undo everything lockZoom() did.
+	 *
+	 * @returns {void}
+	 */
+  FastClick.prototype.unlockZoom = function () {
+    var layer = this.layer;
+    var i;
+    var entry;
+
+    if (this.gestureStartAttached) {
+      layer.removeEventListener('gesturestart', this.onGestureStart, false);
+      this.gestureStartAttached = false;
+    }
+
+    if (this.layerAttributeValue) {
+      if (this.savedLayerAttribute === null) {
+        layer.removeAttribute('data-fastclick-layer');
+      } else {
+        layer.setAttribute('data-fastclick-layer', this.savedLayerAttribute);
+      }
+      this.layerAttributeValue = null;
+      this.savedLayerAttribute = null;
+    }
+
+    if (this.styleElement && this.styleElement.parentNode) {
+      this.styleElement.parentNode.removeChild(this.styleElement);
+    }
+    this.styleElement = null;
+
+    if (this.savedStyle) {
+      for (i = 0; i < this.savedStyle.length; i++) {
+        entry = this.savedStyle[i];
+        if (entry[1]) {
+          layer.style.setProperty(entry[0], entry[1], entry[2]);
+        } else {
+          layer.style.removeProperty(entry[0]);
+        }
+      }
+      this.savedStyle = null;
+    }
+  };
+
+
+	/**
+	 * Keep the iOS pinch gesture from zooming the layer when disableZoom is on.
+	 *
+	 * @param {Event} event
+	 * @returns {boolean}
+	 */
+  FastClick.prototype.onGestureStart = function (event) {
+    if (!this.disableZoom) {
+      return true;
+    }
+
+    event.preventDefault();
+    return false;
+  };
+
+
+	/**
+	 * Remove all FastClick's event listeners and undo the zoom lock.
 	 *
 	 * @returns {void}
 	 */
   FastClick.prototype.destroy = function () {
     var layer = this.layer;
 
-    if (deviceIsAndroid) {
-      layer.removeEventListener('mouseover', this.onMouse, true);
-      layer.removeEventListener('mousedown', this.onMouse, true);
-      layer.removeEventListener('mouseup', this.onMouse, true);
+    if (this.clickListenersAttached) {
+      if (deviceIsAndroid) {
+        layer.removeEventListener('mouseover', this.onMouse, true);
+        layer.removeEventListener('mousedown', this.onMouse, true);
+        layer.removeEventListener('mouseup', this.onMouse, true);
+      }
+
+      layer.removeEventListener('click', this.onClick, true);
+      layer.removeEventListener('touchstart', this.onTouchStart, false);
+      layer.removeEventListener('touchmove', this.onTouchMove, false);
+      layer.removeEventListener('touchend', this.onTouchEnd, false);
+      layer.removeEventListener('touchcancel', this.onTouchCancel, false);
+      this.clickListenersAttached = false;
     }
 
-    layer.removeEventListener('click', this.onClick, true);
-    layer.removeEventListener('touchstart', this.onTouchStart, false);
-    layer.removeEventListener('touchmove', this.onTouchMove, false);
-    layer.removeEventListener('touchend', this.onTouchEnd, false);
-    layer.removeEventListener('touchcancel', this.onTouchCancel, false);
+    this.unlockZoom();
+
+    if (this.oldOnClickWrapper) {
+      layer.removeEventListener('click', this.oldOnClickWrapper, false);
+      layer.onclick = this.oldOnClick;
+      this.oldOnClickWrapper = null;
+      this.oldOnClick = null;
+    }
+
+    // Undo the Android 2 listener patch so the layer is left as we found it.
+    if (this.patchedListeners) {
+      delete layer.addEventListener;
+      delete layer.removeEventListener;
+      this.patchedListeners = false;
+    }
+
+    this.trackingClick = false;
+    this.targetElement = null;
   };
 
 
@@ -749,13 +949,13 @@
     var blackberryVersion;
     var firefoxVersion;
 
-    // Devices that don't support touch don't need FastClick
-    if (typeof window.ontouchstart === 'undefined') {
+    // No DOM (SSR) or no touch support: nothing to fix.
+    if (typeof window === 'undefined' || typeof document === 'undefined' || typeof window.ontouchstart === 'undefined') {
       return true;
     }
 
     // Chrome version - zero for other browsers
-    chromeVersion = +(/Chrome\/([0-9]+)/.exec(navigator.userAgent) || [, 0])[1];
+    chromeVersion = +(/Chrome\/([0-9]+)/.exec(userAgent) || [, 0])[1];
 
     if (chromeVersion) {
 
@@ -780,7 +980,7 @@
     }
 
     if (deviceIsBlackBerry10) {
-      blackberryVersion = navigator.userAgent.match(/Version\/([0-9]*)\.([0-9]*)/);
+      blackberryVersion = userAgent.match(/Version\/([0-9]*)\.([0-9]*)/);
 
       // BlackBerry 10.3+ does not require Fastclick library.
       // https://github.com/ftlabs/fastclick/issues/251
@@ -806,7 +1006,7 @@
     }
 
     // Firefox version - zero for other browsers
-    firefoxVersion = +(/Firefox\/([0-9]+)/.exec(navigator.userAgent) || [, 0])[1];
+    firefoxVersion = +(/Firefox\/([0-9]+)/.exec(userAgent) || [, 0])[1];
 
     if (firefoxVersion >= 27) {
       // Firefox 27+ does not have tap delay if the content is not zoomable - https://bugzilla.mozilla.org/show_bug.cgi?id=922896
